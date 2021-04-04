@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+
+import copy
+import datetime
+import http.server
+import json
+import socket
+import struct
+import threading
+import urllib.parse
+
+__author__     = "Brian Rzycki"
+__copyright__  = "Copyright 2021, Brian Rzycki"
+__credits__    = [ "Brian Rzycki" ]
+__license__    = "Apache-2.0"
+__version__    = "0.0.1"
+__maintainer__ = "Brian Rzycki"
+__email__      = "brzycki@gmail.com"
+__status__     = "Development"
+
+# Ecowitt API hints from:
+# Github pjpeartree/rainmachine-gw1000 gw1000-parser.py
+# Github gjr80/weewx-gw1000 gw1000.py
+
+PORT       = 45000
+PORT_BCAST = 46000
+HEADER     = 0xffff
+
+CMD = {
+    'BROADCAST' : 0x12,
+    'LIVEDATA'  : 0x27,
+}
+
+LIVEDATA = {
+    # command_byte : (type, device, data_length)
+    0x01 : ('temperature',       'indoor',    2),
+    0x02 : ('temperature',       'outdoor',   2),
+    0x06 : ('humidity',          'indoor',    1),
+    0x07 : ('humidity',          'outdoor',   1),
+    0x08 : ('pressure_absolute', 'indoor',    2),
+    0x09 : ('pressure_relative', 'indoor',    2),
+    0x1a : ('temperature',       'channel_1', 2),
+    0x1b : ('temperature',       'channel_2', 2),
+    0x1c : ('temperature',       'channel_3', 2),
+    0x1d : ('temperature',       'channel_4', 2),
+    0x1e : ('temperature',       'channel_5', 2),
+    0x1f : ('temperature',       'channel_6', 2),
+    0x20 : ('temperature',       'channel_7', 2),
+    0x21 : ('temperature',       'channel_8', 2),
+    0x22 : ('humidity',          'channel_1', 1),
+    0x23 : ('humidity',          'channel_2', 1),
+    0x24 : ('humidity',          'channel_3', 1),
+    0x25 : ('humidity',          'channel_4', 1),
+    0x26 : ('humidity',          'channel_5', 1),
+    0x27 : ('humidity',          'channel_6', 1),
+    0x28 : ('humidity',          'channel_7', 1),
+    0x29 : ('humidity',          'channel_8', 1),
+    # FW < 1.6.6 sends battery data.
+    0x4c : ('battery',           '',          16),
+}
+
+def _csum(data):
+    """
+    Ecowitt uses a very simple 1 byte wrapping checksum to validate
+    both requests and responses.
+
+    Returns csum(int).
+    """
+    if isinstance(data, int):
+        data = [data]
+    csum = 0
+    for d in data:
+        csum += d
+    return csum & 0xff
+
+
+def _find(retry_max=3, timeout=1, port_bcast=PORT_BCAST):
+    """
+    Search for the IP address and port of an Ecowitt GW1000 on the
+    local network. Note the detection code seems to only be IPv4.
+
+    Returns ok(bool), name(str), addr(str), port(int). If ok is
+    False all other fields are invalid.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    req_len = 3  # HEADER(2) + len(CMD)(1)
+    # The checksum only sums the CMD and LEN fields.
+    req = struct.pack('!H3B', HEADER, CMD['BROADCAST'], req_len,
+                      _csum(CMD['BROADCAST'] + req_len))
+    data = []
+    for _ in range(retry_max):
+        sock.sendto(req, ('255.255.255.255', port_bcast))
+        try:
+            data = sock.recv(1024)  # Bcast response is 40+ bytes.
+            break
+        except socket.timeout:
+            pass
+    if len(data) > 40:
+        name = data[18:-1].decode('ascii')
+        if name.upper().startswith('GW1000'):
+            port = struct.unpack('!H', data[15:17])[0]
+            addr = struct.unpack('!4s', data[11:15])[0]
+            return True, name, socket.inet_ntoa(addr), port
+    return False, '', '', 0
+
+
+class Device(object):
+    def __init__(self, name):
+        self.name = name
+        self._data = {}
+
+    def add(self, name, value):
+        self._data[name] = value
+
+    def data(self):
+        return copy.deepcopy(self._data)
+
+    def __str__(self):
+        units = { 'temperature'       : ' C',
+                  'humidity'          : '%',
+                  'pressure_relative' : ' hPa',
+                  'pressure_absolute' : ' hPa' }
+        s = f"{self.name}\n"
+        for k in sorted(self._data.keys()):
+            s += f"  {k} : {self._data[k]}{units.get(k, '')}\n"
+        return s[:-1]
+
+
+class hw(object):
+    def __init__(self, host, port, poll, timeout=10):
+        self.host = host
+        self.port = port
+        self.poll = poll
+        self.timeout = timeout
+        self._lk = threading.Lock()
+        self._data = {}
+        self._ts = datetime.datetime.fromtimestamp(0)  # Unix epoch
+
+    def _fetch_livedata(self, retry_max=3):
+        now = datetime.datetime.now()
+        if self._ts + datetime.timedelta(seconds=self.poll) > now:
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect((self.host, self.port))
+
+        # Requests have the following format, in bytes:
+        #   HEADER (2), CMD (1), LEN (1), CSUM (1)
+        # The length is in bytes and includes the header but exludes
+        # the checksum. For our use the length is always 3.
+        # The checksum excludes the header and the csum byte.
+        req_len = 3
+        req = struct.pack('!H3B', HEADER, CMD['LIVEDATA'], req_len,
+                          _csum(CMD['LIVEDATA'] + req_len))
+        for _ in range(retry_max):
+            sock.sendall(req)
+            try:
+                data = sock.recv(1024)  # Livedata is < 100 bytes.
+                break
+            except socket.timeout:
+                pass
+
+        data_len = len(data)
+        assert data_len > 5, (
+            f"Invalid short datagram length {data_len}")
+
+        # Remove the header and csum byte when calculating.
+        csum = _csum(data[2:-1])
+        assert csum == data[-1], (
+            f"Invalid checksum '{csum}' != '{data[-1]}'")
+
+        # Validate the response header.
+        header, cmd, rsp_len = struct.unpack("!HBH", data[:5])
+        assert header == HEADER, (
+            f"Invalid header {header} != {HEADER}")
+        assert cmd == CMD['LIVEDATA'], (
+            f"Invalid cmd {cmd} != {CMD['LIVEDATA']}")
+
+        # Validate the header length matches bytes recived. For some
+        # reason the response length does NOT include the header.
+        assert rsp_len == data_len - 2, (
+            "Invalid response length {rsp_len} != {data_len - 2}")
+
+        # Omit the header and checksum byte to parse the payload.
+        self._parse_livedata(now, data[5:-1])
+
+    def _parse_livedata(self, ts, payload):
+        data, fmt = {}, { 1 : "!B", 2 : "!h" }
+        while (payload):
+            value, tmp = None, LIVEDATA.get(payload[0], None)
+            assert tmp is not None, (
+                f"Invalid command byte {payload[0]}")
+            payload = payload[1:]
+            kind, name, byte_len = tmp
+            assert byte_len <= len(payload), (
+                f"Invalid '{kind}' '{name}' '{payload}'")
+            if kind != 'battery':
+                value = struct.unpack(fmt[byte_len], payload[:byte_len])[0]
+                if kind != 'humidity':
+                    value /= 10.0
+            payload = payload[byte_len:]
+            if value is not None:
+                dev = data.get(name, Device(name))
+                dev.add(kind, value)
+                data[name] = dev
+
+        self._lk.acquire()
+        try:
+            self._ts = copy.deepcopy(ts)
+            self._data = copy.deepcopy(data)
+        finally:
+            self._lk.release()
+
+    def get(self, path, fmt='text'):
+        self._fetch_livedata()
+        self._lk.acquire()
+        try:
+            ts = str(self._ts).partition('.')[0]
+            data = copy.deepcopy(self._data)
+        finally:
+            self._lk.release()
+
+        if path == '/':
+            if fmt == 'json':
+                d = { 'info' : { 'timestamp'     : ts,
+                                 'poll_interval' : self.poll } }
+                for k in data:
+                    d[k] = data[k].data()
+                return json.dumps(d)
+            s = f"timestamp : {ts}\n"
+            s += f"poll interval : {self.poll} seconds\n\n"
+            for k in sorted(data):
+                s += f"{data[k]}\n\n"
+            return s[:-2]
+
+        spath = path.split('/')
+        name = spath[1].lower()
+        d = data.get(name, None)
+        if d is None:
+            return None
+        key = ''
+        if len(spath) > 2 and spath[2]:
+            key = spath[2].lower()
+
+        if not key:
+            if fmt == 'json':
+                return json.dumps(d.data())
+            return str(d)
+        else:
+            value = d.data().get(key, None)
+            if value is not None:
+                if fmt == 'json':
+                    return json.dumps({key : value})
+                return f"{value}"
+        return None
+
+
+class srv(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        if p.path == '/favicon.ico':
+            self.send_error(404)
+            return
+        path = p.path
+        while '//' in path:
+            path = path.replace('//', '/')
+        if path == '':
+            path = '/'
+        q = urllib.parse.parse_qs(p.query)
+        fmt = q.get('format', ['text'])[-1].lower()
+        if fmt not in ('text', 'json'):
+            fmt = 'text'
+
+        raw = _HW.get(path, fmt)
+        if raw is None:
+            self.send_error(404)
+            return
+        raw = bytes(raw, 'ascii')
+
+        content = 'text/plain'
+        if fmt == 'json':
+            content = 'application/json'
+        self.send_response(200)
+        self.send_header('Content-type', content)
+        self.send_header('Content-length', len(raw))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    p = argparse.ArgumentParser(
+            description='Ecowitt GW1000 HTTP REST API front-end server',
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--name', default='',
+                   help="http listen hostname/ip, ''=all")
+    p.add_argument('--port', type=int, default=9000,
+                   help='http listen port')
+    p.add_argument('-p', '--poll', type=int, default=180,
+                   help='polling interval to the GW1000, in seconds')
+    p.add_argument('-l', '--list', default=False, action='store_true',
+                   help='List available GW1000 devices')
+    p.add_argument('gw1000', metavar='GW1000', nargs='?', default='auto',
+                   help='Ecowitt GW1000 IP/NAME[:PORT]')
+    args = p.parse_args()
+
+    if args.list or args.gw1000 == 'auto':
+        ok, name, ip, port = _find()
+        if not ok:
+            p.error("no GW1000 device found")
+        print(name, f"{ip}:{port}")
+        if args.list:
+            sys.exit(0)
+        args.gw1000 = f"{ip}:{port}"
+
+    if not 10 <= args.poll <= 3600:
+        p.error(f"poll interval not in 10 <= {args.poll} <= 3600")
+
+    if ":" not in args.gw1000:
+        args.gw1000 += f":{PORT}"
+    gwaddr, gwport = args.gw1000.strip().split(":")[:2]
+    if not gwaddr:
+        p.error("empty GW1000 address")
+    try:
+        gwport = int(gwport)
+    except ValueError:
+        p.error(f"invalid GW1000 port '{gwport}'")
+    if not 0 < gwport <= 65535:
+        p.error(f"GW1000 port must be 0 < {gwport} <= 65535")
+
+    global _HW
+    _HW = hw(gwaddr, gwport, args.poll)
+
+    try:
+        ws = http.server.ThreadingHTTPServer((args.name, args.port), srv)
+    except OSError as e:
+        p.error(e.reason)
+    print(f"HTTP server started '{args.name}:{args.port}'")
+
+    try:
+        ws.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    ws.server_close()
+    print("\nstopped")
