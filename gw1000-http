@@ -22,6 +22,7 @@ __status__     = "Development"
 # Github pjpeartree/rainmachine-gw1000 gw1000-parser.py
 # Github gjr80/weewx-gw1000 gw1000.py
 
+API        = 1
 PORT       = 45000
 PORT_BCAST = 46000
 HEADER     = 0xffff
@@ -226,12 +227,15 @@ class hw(object):
         if path == '/':
             if fmt == 'json':
                 d = { 'info' : { 'timestamp'     : ts,
-                                 'poll_interval' : self.poll } }
+                                 'poll_interval' : self.poll,
+                                 'api'           : API } }
                 for k in data:
                     d[k] = data[k].data()
                 return json.dumps(d)
-            s = f"timestamp : {ts}\n"
-            s += f"poll interval : {self.poll} seconds\n\n"
+            s = "information\n"
+            s += f"  api : {API}\n"
+            s += f"  timestamp : {ts}\n"
+            s += f"  poll_interval : {self.poll} seconds\n\n"
             for k in sorted(data):
                 s += f"{data[k]}\n\n"
             return s[:-2]
@@ -339,7 +343,7 @@ if __name__ == "__main__":
     try:
         ws = http.server.ThreadingHTTPServer((args.name, args.port), srv)
     except OSError as e:
-        p.error(e.reason)
+        p.error(str(e))
     print(f"HTTP server started '{args.name}:{args.port}'")
 
     try:
