@@ -182,7 +182,7 @@ def _find(retry_max=3, timeout=1, port_bcast=PORT_BCAST):
             pass
     if len(data) > 40:
         name = data[18:-1].decode('ascii')
-        if name.upper().startswith('GW1000'):
+        if name.upper().startswith(('GW1000', 'GW1100')):
             port = struct.unpack('!H', data[15:17])[0]
             addr = struct.unpack('!4s', data[11:15])[0]
             return True, name, socket.inet_ntoa(addr), port
